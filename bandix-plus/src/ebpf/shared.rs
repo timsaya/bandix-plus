@@ -1,6 +1,6 @@
 use aya::Ebpf;
-use aya::programs::{LinkOrder, ProgramId};
 use aya::programs::tc::{self, NlOptions, SchedClassifier, TcAttachOptions, TcAttachType};
+use aya::programs::{LinkOrder, ProgramId};
 use log::debug;
 use nix::sys::utsname;
 
@@ -197,11 +197,7 @@ pub fn load_ebpf_programs(
                 .map_err(|e: aya::programs::ProgramError| {
                     anyhow::anyhow!("Failed to convert ingress program to SchedClassifier: {:?}", e)
                 })?;
-            ingress_program.attach_with_options(
-                iface,
-                TcAttachType::Ingress,
-                opts(TcAttachType::Ingress)?,
-            )?;
+            ingress_program.attach_with_options(iface, TcAttachType::Ingress, opts(TcAttachType::Ingress)?)?;
         }
         {
             let egress_program: &mut SchedClassifier = ebpf
@@ -211,11 +207,7 @@ pub fn load_ebpf_programs(
                 .map_err(|e: aya::programs::ProgramError| {
                     anyhow::anyhow!("Failed to convert egress program to SchedClassifier: {:?}", e)
                 })?;
-            egress_program.attach_with_options(
-                iface,
-                TcAttachType::Egress,
-                opts(TcAttachType::Egress)?,
-            )?;
+            egress_program.attach_with_options(iface, TcAttachType::Egress, opts(TcAttachType::Egress)?)?;
         }
     }
 

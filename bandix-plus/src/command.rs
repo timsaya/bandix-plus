@@ -49,8 +49,6 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
 
 /// 加载 eBPF、拓扑与策略，启动采集循环与 API 服务。
 async fn run_service(options: &Options) -> anyhow::Result<()> {
-    const PERIODIC_PERSIST_INTERVAL_MS: u64 = 10 * 60 * 1000;
-
     let topology = TopologySnapshot::discover()?;
     let persistence = Arc::new(PersistenceManager::new(&options.data_dir)?);
 
@@ -69,10 +67,8 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
         );
     }
     log::info!("persistence data dir={}", persistence.data_dir().display());
-    log::info!(
-        "traffic persistence enabled={}",
-        options.traffic_enable_storage
-    );
+    log::info!("traffic persistence enabled={}", options.traffic_enable_storage);
+    log::info!("traffic persist interval={}s", options.traffic_flush_interval);
 
     let policy = parse_policy();
 
@@ -126,6 +122,7 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
         policy_runtime: Arc::clone(&policy_runtime),
         topology: Arc::clone(&topology_state),
         persistence: Some(Arc::clone(&persistence)),
+        traffic_enable_storage: options.traffic_enable_storage,
     };
 
     // 解析 TC 后端/顺序并加载 eBPF 实例
@@ -151,6 +148,7 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     let collector_monitor_ifaces = monitor_ifaces;
     let collector_persistence = Arc::clone(&persistence);
     let collector_traffic_enable_storage = options.traffic_enable_storage;
+    let periodic_persist_interval_ms = options.traffic_flush_interval.saturating_mul(1000);
     tokio::spawn(async move {
         let mut last_periodic_persist_ms = 0u64;
         let mut ticker = tokio::time::interval(collect_interval);
@@ -212,7 +210,7 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
                         *guard = data.clone();
                     }
 
-                    if data.timestamp_ms.saturating_sub(last_periodic_persist_ms) >= PERIODIC_PERSIST_INTERVAL_MS {
+                    if data.timestamp_ms.saturating_sub(last_periodic_persist_ms) >= periodic_persist_interval_ms {
                         let topo = collector_topology.read().await.clone();
                         let runtime_saved = {
                             let runtime_guard = collector_monitor_runtime.read().await;
@@ -296,12 +294,8 @@ fn validate_arguments(options: &Options) -> anyhow::Result<()> {
                 }
             }
             _ => {
-                if options.tcx_anchor_ingress_id.is_some()
-                    || options.tcx_anchor_egress_id.is_some()
-                {
-                    anyhow::bail!(
-                        "--tcx-anchor-ingress-id and --tcx-anchor-egress-id can only be used when --tc-order is before/after"
-                    );
+                if options.tcx_anchor_ingress_id.is_some() || options.tcx_anchor_egress_id.is_some() {
+                    anyhow::bail!("--tcx-anchor-ingress-id and --tcx-anchor-egress-id can only be used when --tc-order is before/after");
                 }
             }
         }
@@ -309,6 +303,9 @@ fn validate_arguments(options: &Options) -> anyhow::Result<()> {
 
     if options.host.trim().is_empty() {
         anyhow::bail!("--host cannot be empty");
+    }
+    if options.traffic_flush_interval == 0 {
+        anyhow::bail!("--traffic_flush_interval must be greater than 0");
     }
 
     Ok(())

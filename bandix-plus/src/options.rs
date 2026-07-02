@@ -61,6 +61,14 @@ pub struct Options {
     )]
     pub traffic_enable_storage: bool,
 
+    #[arg(
+        long = "traffic_flush_interval",
+        alias = "traffic-flush-interval",
+        default_value_t = 600,
+        help = "Traffic data checkpoint interval in seconds (default: 600)"
+    )]
+    pub traffic_flush_interval: u64,
+
     #[arg(short, long, help = "Network interface to monitor (can specify multiple times)")]
     pub iface: Vec<String>,
 
@@ -71,7 +79,11 @@ pub struct Options {
     )]
     pub log_level: String,
 
-    #[arg(long, default_value = "default", help = "TC order: first, default, last, before, after")]
+    #[arg(
+        long,
+        default_value = "default",
+        help = "TC order: first, default, last, before, after"
+    )]
     pub tc_order: String,
 
     #[arg(
