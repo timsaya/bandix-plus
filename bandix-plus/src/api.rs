@@ -4,7 +4,7 @@ use std::sync::Arc;
 use axum::extract::{Path, Query, State};
 use axum::http::{Method, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::{delete, get, put};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use chrono::{Datelike, Duration as ChronoDuration, Local, TimeZone};
 use log::{info, warn};
@@ -36,6 +36,7 @@ pub struct ApiState {
     pub policy_runtime: Arc<RwLock<PolicyRuntime>>,
     pub topology: Arc<RwLock<TopologySnapshot>>,
     pub persistence: Option<Arc<PersistenceManager>>,
+    pub traffic_enable_storage: bool,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -129,6 +130,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/trend", get(history))
         .route("/api/histogram", get(aggregate))
         .route("/api/usage_ranking", get(usage_ranking))
+        .route("/api/traffic/persist", post(persist_traffic))
         .route("/api/policy", get(policy))
         .route("/api/rate_limit/schedules", get(get_schedules).post(create_schedule))
         .route(
@@ -999,10 +1001,7 @@ async fn set_guest_default_handler(
 }
 
 async fn delete_guest_default_handler(State(state): State<ApiState>, Path(iface): Path<String>) -> Json<ApiEnvelope<&'static str>> {
-    info!(
-        "api DELETE /api/rate_limit/guest_defaults/{iface} call iface={}",
-        iface
-    );
+    info!("api DELETE /api/rate_limit/guest_defaults/{iface} call iface={}", iface);
     let result = {
         let mut guard = state.policy_runtime.write().await;
         delete_guest_default(&mut guard, &iface)
@@ -1108,6 +1107,41 @@ async fn persist_monitor_runtime_state(state: &ApiState) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn persist_traffic(State(state): State<ApiState>) -> Json<ApiEnvelope<&'static str>> {
+    if !state.traffic_enable_storage || state.persistence.is_none() {
+        return Json(ApiEnvelope {
+            ok: false,
+            data: "error",
+            error: Some("traffic storage is not enabled".to_string()),
+        });
+    }
+
+    match persist_traffic_state(&state).await {
+        Ok(_) => Json(ApiEnvelope {
+            ok: true,
+            data: "ok",
+            error: None,
+        }),
+        Err(e) => Json(ApiEnvelope {
+            ok: false,
+            data: "error",
+            error: Some(format!("persist traffic failed: {}", e)),
+        }),
+    }
+}
+
+async fn persist_traffic_state(state: &ApiState) -> anyhow::Result<()> {
+    if let Some(p) = &state.persistence {
+        let topo = state.topology.read().await;
+        let runtime = state.monitor_runtime.read().await;
+        p.save_monitor_runtime(&runtime, &topo)?;
+
+        let histogram = state.histogram.read().await;
+        p.save_current_hour_histogram(&histogram, &topo)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1149,6 +1183,7 @@ mod tests {
             policy_runtime: Arc::new(RwLock::new(init_runtime(parse_policy()))),
             topology: Arc::new(RwLock::new(topo)),
             persistence: None,
+            traffic_enable_storage: false,
         }
     }
 
