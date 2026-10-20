@@ -42,7 +42,15 @@ pub struct ApiState {
 pub struct DevicesQuery {
     pub iface: Option<String>,
     pub period: Option<String>,
+    /// 从过滤后的设备列表中的哪个位置开始返回，默认 0。
+    pub offset: Option<usize>,
+    /// 本次最多返回多少条设备记录。
+    pub limit: Option<usize>,
 }
+/// 默认每页最多返回 100 条。
+const DEFAULT_DEVICES_PAGE_SIZE: usize = 100;
+/// 即使调用方指定更大的 limit，也不能超过 200 条。
+const MAX_DEVICES_PAGE_SIZE: usize = 200;
 
 #[derive(Debug, Deserialize, Default)]
 pub struct OverviewQuery {
@@ -305,7 +313,10 @@ async fn overview(
     })
 }
 
-async fn devices(State(state): State<ApiState>, Query(q): Query<DevicesQuery>) -> Json<ApiEnvelope<Vec<crate::monitor::DeviceListItem>>> {
+async fn devices(
+    State(state): State<ApiState>,
+    Query(q): Query<DevicesQuery>,
+) -> Json<ApiEnvelope<Vec<crate::monitor::DeviceListItem>>> {
     let period = match parse_period_scope(q.period.as_deref()) {
         Ok(v) => v,
         Err(e) => {
@@ -316,26 +327,66 @@ async fn devices(State(state): State<ApiState>, Query(q): Query<DevicesQuery>) -
             });
         }
     };
-    let devices = state.snapshot.read().await.devices.clone();
-    let mut filtered: Vec<_> = devices
-        .into_iter()
-        .filter(|d| {
-            if let Some(ref iface) = q.iface {
-                if !iface.is_empty() && d.logical_iface != *iface {
-                    return false;
+
+    // 先筛选接口，再按接口名称和 MAC 地址排序，
+    // 保证连续分页时有稳定的记录顺序。
+    let mut matching: Vec<_> = {
+        let snapshot = state.snapshot.read().await;
+
+        snapshot
+            .devices
+            .iter()
+            .filter(|d| {
+                match q.iface.as_deref() {
+                    Some(iface) if !iface.is_empty() => {
+                        d.logical_iface.as_str() == iface
+                    }
+                    _ => true,
                 }
-            }
-            true
-        })
+            })
+            .cloned()
+            .collect()
+    };
+
+    matching.sort_by(|a, b| {
+        a.logical_iface
+            .cmp(&b.logical_iface)
+            .then_with(|| a.mac.cmp(&b.mac))
+    });
+
+    // 限制单次返回的记录数量。offset 超出记录数时返回空数组。
+    let offset = q.offset.unwrap_or(0).min(matching.len());
+
+    let limit = q
+        .limit
+        .unwrap_or(DEFAULT_DEVICES_PAGE_SIZE)
+        .clamp(1, MAX_DEVICES_PAGE_SIZE);
+
+    let mut filtered: Vec<_> = matching
+        .into_iter()
+        .skip(offset)
+        .take(limit)
         .collect();
+
+    // 仅为本页设备计算历史累计流量，避免一次处理全部历史设备。
     if let Some(scope) = period {
         let (start_ms, end_ms) = period_range_ms(scope, now_millis());
         let histogram = state.histogram.read().await;
+
         for item in &mut filtered {
-            let buckets = histogram.query_aggregate(item.ifindex, Some(item.mac.as_str()), start_ms, end_ms, AggregateBucket::Hourly);
+            let buckets = histogram.query_aggregate(
+                item.ifindex,
+                Some(item.mac.as_str()),
+                start_ms,
+                end_ms,
+                AggregateBucket::Hourly,
+            );
+
             item.cumulative = cumulative_from_buckets(&buckets);
         }
     }
+
+    // 保持现有 ApiEnvelope + data 数组结构，减少 API 兼容性影响。
     Json(ApiEnvelope {
         ok: true,
         data: filtered,
@@ -1335,6 +1386,56 @@ mod tests {
         let req = Request::get("/api/devices?iface=eth0").body(Body::empty()).unwrap();
         let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+    }
+    
+    #[tokio::test]
+    async fn api_devices_with_offset_and_limit() {
+        let state = mock_api_state();
+
+        {
+            let mut snapshot = state.snapshot.write().await;
+
+            for i in 1..=5 {
+                snapshot.devices.push(DeviceListItem {
+                    ifindex: 1,
+                    logical_iface: "eth0".to_string(),
+                    subnet: "-".to_string(),
+                    ipv4: vec![],
+                    ipv6: vec![],
+                    mac: format!("02:00:00:00:00:{:02x}", i),
+                    hostname: format!("device-{}", i),
+                    metrics: CounterQuad::default(),
+                    cumulative: CounterQuad::default(),
+                    online: false,
+                    last_seen_ms: 0,
+                    neighbor_state: None,
+                });
+            }
+        }
+
+        let app = router(state);
+
+        let req = Request::get("/api/devices?iface=eth0&offset=1&limit=2")
+            .body(Body::empty())
+            .unwrap();
+
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let env: ApiEnvelope<serde_json::Value> =
+            serde_json::from_slice(&body).unwrap();
+
+        assert!(env.ok);
+        assert_eq!(env.data.as_array().unwrap().len(), 2);
+        assert_eq!(
+            env.data[0]["mac"].as_str(),
+            Some("02:00:00:00:00:02")
+        );
+        assert_eq!(
+            env.data[1]["mac"].as_str(),
+            Some("02:00:00:00:00:03")
+        );
     }
 
     #[tokio::test]
